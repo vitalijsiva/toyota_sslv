@@ -62,6 +62,9 @@ logging.getLogger('httpx').setLevel(logging.WARNING)
 
 # Configuration
 TELEGRAM_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
+BOT_OWNER_ID = os.getenv('BOT_OWNER_ID')  # Set this in .env for auto-start
+AUTO_START = os.getenv('AUTO_START', 'true').lower() == 'true'  # Auto-start monitoring
+AUTO_NOTIFY = os.getenv('AUTO_NOTIFY', 'true').lower() == 'true'  # Auto-enable notifications for all users
 SS_LV_URLS = [
     'https://www.ss.lv/lv/transport/cars/toyota/today/sell/',
     'https://www.ss.lv/lv/transport/other/transport-with-defects-or-after-crash/sell/',
@@ -721,24 +724,50 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     """
     Handle /start command - greet user and explain bot usage
     """
-    welcome_message = (
-        "👋 Welcome to the Toyota Car Notifier Bot!\n\n"
-        "This bot monitors ss.lv for Toyota listings.\n\n"
-        "📋 Available commands:\n"
-        "/start - Show this welcome message\n"
-        "/subscribe - Get instant notifications for new listings\n"
-        "/unsubscribe - Stop receiving notifications\n"
-        "/search - Search current matching listings\n\n"
-        "⚡ Instant notifications - get alerts within 30 seconds!\n\n"
-        "🔍 Monitoring:\n"
-        "• All petrol/gasoline Toyotas\n"
-        "• Diesel Hilux\n"
-        "• Diesel Land Cruiser\n\n"
-        "Happy car hunting!"
-    )
+    user_id = update.effective_user.id
+    
+    # Auto-subscribe user if auto-notifications are enabled
+    if AUTO_NOTIFY:
+        subscribed_users.add(user_id)
+        logger.info(f"Auto-subscribed user {user_id}")
+        
+        welcome_message = (
+            "👋 Welcome to the Toyota Car Notifier Bot!\n\n"
+            "✅ You're automatically subscribed to notifications!\n\n"
+            "This bot monitors ss.lv for Toyota listings.\n\n"
+            "📋 Available commands:\n"
+            "/start - Show this welcome message\n"
+            "/subscribe - Get instant notifications for new listings\n"
+            "/unsubscribe - Stop receiving notifications\n"
+            "/search - Search current matching listings\n\n"
+            "⚡ Instant notifications - get alerts within 40 seconds!\n\n"
+            "🔍 Monitoring:\n"
+            "• 🚘 All Petrol/Benzin Toyotas\n"
+            "• 🛻 Diesel Hilux Models\n"
+            "• 🚙 Diesel Land Cruiser Models\n"
+            "• 🚨 ANY Toyota from Crash Page\n\n"
+            "📬 You'll receive instant notifications for new listings!\n\n"
+            "Happy car hunting!"
+        )
+    else:
+        welcome_message = (
+            "👋 Welcome to the Toyota Car Notifier Bot!\n\n"
+            "This bot monitors ss.lv for Toyota listings.\n\n"
+            "📋 Available commands:\n"
+            "/start - Show this welcome message\n"
+            "/subscribe - Get instant notifications for new listings\n"
+            "/unsubscribe - Stop receiving notifications\n"
+            "/search - Search current matching listings\n\n"
+            "⚡ Instant notifications - get alerts within 40 seconds!\n\n"
+            "🔍 Monitoring:\n"
+            "• All petrol/gasoline Toyotas\n"
+            "• Diesel Hilux\n"
+            "• Diesel Land Cruiser\n\n"
+            "Happy car hunting!"
+        )
     
     await update.message.reply_text(welcome_message)
-    logger.info(f"User {update.effective_user.id} started the bot")
+    logger.info(f"User {user_id} started the bot")
 
 
 async def subscribe_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -746,17 +775,30 @@ async def subscribe_command(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     Subscribe user to instant notifications for new Toyota listings
     """
     user_id = update.effective_user.id
-    subscribed_users.add(user_id)
     
-    message = (
-        "✅ Subscribed to instant notifications!\n\n"
-        "You will receive alerts for:\n"
-        "• All petrol/gasoline Toyotas\n"
-        "• Diesel Hilux\n"
-        "• Diesel Land Cruiser\n\n"
-        "📬 New listings will be sent instantly!\n\n"
-        "Use /unsubscribe to stop notifications."
-    )
+    if user_id in subscribed_users:
+        message = (
+            "✅ You're already subscribed to notifications!\n\n"
+            "You will receive alerts for:\n"
+            "• 🚘 All Petrol/Benzin Toyotas\n"
+            "• 🛻 Diesel Hilux Models\n"
+            "• 🚙 Diesel Land Cruiser Models\n"
+            "• 🚨 ANY Toyota from Crash Page\n\n"
+            "📬 New listings will be sent instantly!\n\n"
+            "Use /unsubscribe to stop notifications."
+        )
+    else:
+        subscribed_users.add(user_id)
+        message = (
+            "✅ Subscribed to instant notifications!\n\n"
+            "You will receive alerts for:\n"
+            "• 🚘 All Petrol/Benzin Toyotas\n"
+            "• 🛻 Diesel Hilux Models\n"
+            "• 🚙 Diesel Land Cruiser Models\n"
+            "• 🚨 ANY Toyota from Crash Page\n\n"
+            "📬 New listings will be sent instantly!\n\n"
+            "Use /unsubscribe to stop notifications."
+        )
     
     await update.message.reply_text(message)
     logger.info(f"User {user_id} subscribed to notifications")
@@ -873,6 +915,51 @@ async def send_notifications_async(context: ContextTypes.DEFAULT_TYPE, new_listi
                     logger.warning("User blocked bot - removed from subscribers")
 
 
+async def auto_start_monitoring(application) -> None:
+    """
+    Auto-start monitoring - starts monitoring immediately without requiring owner ID
+    """
+    if AUTO_START:
+        logger.info("🚀 Auto-start: Monitoring started automatically")
+        
+        # If owner ID is provided, subscribe them automatically
+        if BOT_OWNER_ID:
+            try:
+                owner_id = int(BOT_OWNER_ID)
+                subscribed_users.add(owner_id)
+                logger.info(f"🚀 Auto-start: Added bot owner {owner_id} to subscribers")
+                
+                # Send welcome message to owner
+                welcome_msg = (
+                    "🤖 Toyota Bot Auto-Started!\n\n"
+                    "✅ You're automatically subscribed to notifications\n\n"
+                    "🔍 Monitoring:\n"
+                    "• 🚘 All Petrol/Benzin Toyotas\n"
+                    "• 🛻 Diesel Hilux Models\n"
+                    "• 🚙 Diesel Land Cruiser Models\n"
+                    "• 🚨 ANY Toyota from Crash Page\n\n"
+                    f"⚡ Checking every {CHECK_INTERVAL} seconds\n"
+                )
+                
+                if AUTO_NOTIFY:
+                    welcome_msg += "🔔 Auto-notifications: ENABLED for all users\n"
+                else:
+                    welcome_msg += "📱 Manual subscription required for other users\n"
+                    
+                welcome_msg += "📬 You'll get instant notifications!"
+                
+                await application.bot.send_message(chat_id=owner_id, text=welcome_msg)
+                logger.info("Auto-start welcome message sent to owner")
+            except ValueError:
+                logger.error(f"Invalid BOT_OWNER_ID: {BOT_OWNER_ID}")
+            except Exception as e:
+                logger.error(f"Auto-start owner subscription failed: {e}")
+        else:
+            logger.info(f"Auto-start monitoring enabled - Auto-notifications: {'ON' if AUTO_NOTIFY else 'OFF'}")
+    else:
+        logger.info("Auto-start disabled")
+
+
 async def scheduled_check(context: ContextTypes.DEFAULT_TYPE) -> None:
     """
     Scheduled task to check for new Toyota listings
@@ -949,7 +1036,16 @@ def main() -> None:
             application.add_handler(CommandHandler("unsubscribe", unsubscribe_command))
             application.add_handler(CommandHandler("search", search_command))
             
-            # Add scheduled job for instant notifications (runs every 30 seconds)
+            # Initialize auto-start monitoring
+            if AUTO_START:
+                # Use a one-time job to set up auto-start after bot is fully initialized
+                job_queue = application.job_queue
+                job_queue.run_once(
+                    lambda context: auto_start_monitoring(application),
+                    when=5  # Wait 5 seconds for bot to be ready
+                )
+            
+            # Add scheduled job for instant notifications (runs every 40 seconds)
             job_queue = application.job_queue
             job_queue.run_repeating(
                 scheduled_check,
@@ -966,6 +1062,19 @@ def main() -> None:
             print(f"   4. Toyota Land Cruiser (sell)")
             print(f"⛽ Filters: Petrol Toyotas + Diesel Hilux/Land Cruiser + ANY Toyota from crash page")
             print(f"⚡ Checking for new cars every {CHECK_INTERVAL} seconds")
+            
+            if AUTO_START and BOT_OWNER_ID:
+                print(f"🚀 Auto-start: ENABLED with owner subscription (Owner: {BOT_OWNER_ID})")
+            elif AUTO_START:
+                print("🚀 Auto-start: ENABLED - Monitoring active (no owner subscription)")
+            else:
+                print("📱 Auto-start: DISABLED (manual /subscribe required)")
+                
+            if AUTO_NOTIFY:
+                print("🔔 Auto-notifications: ENABLED (users auto-subscribed on /start)")
+            else:
+                print("📱 Auto-notifications: DISABLED (manual /subscribe required)")
+                
             print(f"📝 Logging to: toyota_bot.log")
             print("Press Ctrl+C to stop")
             
