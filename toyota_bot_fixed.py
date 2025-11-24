@@ -10,6 +10,8 @@ import sys
 import logging
 import asyncio
 import time
+import signal
+from pathlib import Path
 from datetime import datetime
 from typing import List, Dict, Optional
 import requests
@@ -47,6 +49,63 @@ if sys.platform == 'win32':
 
 # Load environment variables
 load_dotenv()
+
+# Bot configuration
+CHECK_INTERVAL = 40  # seconds
+REQUEST_TIMEOUT = 30
+MAX_RETRIES = 3
+LOCK_FILE = Path("toyota_bot.lock")
+
+def create_lock_file():
+    """Create lock file to prevent multiple bot instances"""
+    try:
+        if LOCK_FILE.exists():
+            # Check if the process is still running
+            with open(LOCK_FILE, 'r') as f:
+                old_pid = f.read().strip()
+            
+            # Try to check if old process exists (Windows)
+            try:
+                import psutil
+                if psutil.pid_exists(int(old_pid)):
+                    print(f"❌ Another bot instance is already running (PID: {old_pid})")
+                    print("   Please stop the other instance first or wait a moment.")
+                    return False
+                else:
+                    print(f"🧹 Cleaning up stale lock file from PID: {old_pid}")
+                    LOCK_FILE.unlink()
+            except (ImportError, ValueError, ProcessLookupError):
+                # If psutil not available or PID check fails, remove old lock
+                print("🧹 Removing old lock file")
+                LOCK_FILE.unlink()
+        
+        # Create new lock file
+        with open(LOCK_FILE, 'w') as f:
+            f.write(str(os.getpid()))
+        print(f"🔒 Created lock file with PID: {os.getpid()}")
+        return True
+    except Exception as e:
+        print(f"⚠️ Warning: Could not create lock file: {e}")
+        return True  # Continue anyway
+
+def remove_lock_file():
+    """Remove lock file on exit"""
+    try:
+        if LOCK_FILE.exists():
+            LOCK_FILE.unlink()
+            print("🔓 Removed lock file")
+    except Exception as e:
+        print(f"Warning: Could not remove lock file: {e}")
+
+def signal_handler(signum, frame):
+    """Handle Ctrl+C gracefully"""
+    print("\n🛑 Received stop signal, shutting down...")
+    remove_lock_file()
+    sys.exit(0)
+
+# Setup signal handlers
+signal.signal(signal.SIGINT, signal_handler)
+signal.signal(signal.SIGTERM, signal_handler)
 
 # Configure logging with more detailed output
 logging.basicConfig(
@@ -1011,103 +1070,122 @@ def main() -> None:
         print("Please set TELEGRAM_BOT_TOKEN in your .env file")
         return
     
-    while True:
-        try:
-            # Create application
-            application = Application.builder().token(TELEGRAM_TOKEN).build()
-            
-            # Add error handler for conflicts and other errors
-            async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
-                """Handle errors caused by updates."""
-                if "Conflict" in str(context.error):
-                    # Ignore conflict errors (multiple instances)
-                    return
-                logger.error(f"Exception while handling an update: {context.error}")
-            
-            application.add_error_handler(error_handler)
-            
-            # Add command handlers
-            application.add_handler(CommandHandler("start", start_command))
-            application.add_handler(CommandHandler("subscribe", subscribe_command))
-            application.add_handler(CommandHandler("unsubscribe", unsubscribe_command))
-            application.add_handler(CommandHandler("search", search_command))
-            
-            # Setup job queue for scheduled tasks
-            job_queue = application.job_queue
-            
-            # Initialize auto-start monitoring
-            if AUTO_START:
-                # Use a one-time job to set up auto-start after bot is fully initialized
-                async def setup_auto_start(context):
-                    try:
-                        await auto_start_monitoring(application)
-                    except Exception as e:
-                        logger.error(f"Error in setup_auto_start: {e}")
+    # Check for existing bot instance
+    if not create_lock_file():
+        return
+    
+    try:
+        while True:
+            try:
+                # Create application
+                application = Application.builder().token(TELEGRAM_TOKEN).build()
                 
-                job_queue.run_once(
-                    setup_auto_start,
-                    when=5  # Wait 5 seconds for bot to be ready
-                )
-            
-            # Add scheduled job for instant notifications (runs every 40 seconds)
-            async def scheduled_check_wrapper(context):
-                try:
-                    await scheduled_check(context)
-                except Exception as e:
-                    logger.error(f"Error in scheduled_check_wrapper: {e}")
-            
-            job_queue.run_repeating(
-                scheduled_check_wrapper,
-                interval=CHECK_INTERVAL,
+                # Add error handler for conflicts and other errors
+                async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+                    """Handle errors caused by updates."""
+                    error_str = str(context.error)
+                    if "Conflict" in error_str or "getUpdates" in error_str:
+                        # This is a critical conflict - another bot instance is running
+                        logger.error("❌ CRITICAL: Another bot instance detected! Shutting down to prevent conflicts.")
+                        print("❌ CRITICAL ERROR: Another bot instance is running with the same token!")
+                        print("   This bot will shut down to prevent conflicts.")
+                        print("   Please ensure only one instance is running at a time.")
+                        
+                        # Graceful shutdown
+                        remove_lock_file()
+                        context.application.stop_running()
+                        return
+                    
+                    # Log other errors but don't shutdown
+                    logger.error(f"Exception while handling an update: {context.error}")
+                
+                application.add_error_handler(error_handler)
+                
+                # Add command handlers
+                application.add_handler(CommandHandler("start", start_command))
+                application.add_handler(CommandHandler("subscribe", subscribe_command))
+                application.add_handler(CommandHandler("unsubscribe", unsubscribe_command))
+                application.add_handler(CommandHandler("search", search_command))
+                
+                # Setup job queue for scheduled tasks
+                job_queue = application.job_queue
+                
+                # Initialize auto-start monitoring
+                if AUTO_START:
+                    # Use a one-time job to set up auto-start after bot is fully initialized
+                    async def setup_auto_start(context):
+                        try:
+                            await auto_start_monitoring(application)
+                        except Exception as e:
+                            logger.error(f"Error in setup_auto_start: {e}")
+                    
+                    job_queue.run_once(
+                        setup_auto_start,
+                        when=5  # Wait 5 seconds for bot to be ready
+                    )
+                
+                # Add scheduled job for instant notifications (runs every 40 seconds)
+                async def scheduled_check_wrapper(context):
+                    try:
+                        await scheduled_check(context)
+                    except Exception as e:
+                        logger.error(f"Error in scheduled_check_wrapper: {e}")
+                
+                job_queue.run_repeating(
+                    scheduled_check_wrapper,
+                    interval=CHECK_INTERVAL,
                 first=30  # First run after 30 seconds
             )
-            
-            logger.info("Bot started successfully with instant notifications!")
-            print("🤖 Toyota Notifier Bot is running...")
-            print(f"🔍 Monitoring 4 sources:")
-            print(f"   1. Toyota section (today/sell)")
-            print(f"   2. Transport with defects/after crash (sell)")
-            print(f"   3. Toyota Hilux (sell)")
-            print(f"   4. Toyota Land Cruiser (sell)")
-            print(f"⛽ Filters: Petrol Toyotas + Diesel Hilux/Land Cruiser + ANY Toyota from crash page")
-            print(f"⚡ Checking for new cars every {CHECK_INTERVAL} seconds")
-            
-            if AUTO_START:
-                print("🚀 Auto-start: ENABLED - Monitoring active")
-            else:
-                print("📱 Auto-start: DISABLED (manual operation)")
                 
-            if AUTO_NOTIFY:
-                print("🔔 Auto-notifications: ENABLED (users auto-subscribed on /start)")
-            else:
-                print("📱 Auto-notifications: DISABLED (manual /subscribe required)")
+                logger.info("Bot started successfully with instant notifications!")
+                print("🤖 Toyota Notifier Bot is running...")
+                print(f"🔍 Monitoring 4 sources:")
+                print(f"   1. Toyota section (today/sell)")
+                print(f"   2. Transport with defects/after crash (sell)")
+                print(f"   3. Toyota Hilux (sell)")
+                print(f"   4. Toyota Land Cruiser (sell)")
+                print(f"⛽ Filters: Petrol Toyotas + Diesel Hilux/Land Cruiser + ANY Toyota from crash page")
+                print(f"⚡ Checking for new cars every {CHECK_INTERVAL} seconds")
                 
-            print(f"📝 Logging to: toyota_bot.log")
-            print("Press Ctrl+C to stop")
-            
-            # Run the bot with improved settings
-            application.run_polling(
-                drop_pending_updates=True,
-                poll_interval=2.0,  # Increased interval to reduce conflicts
-                close_loop=False    # Don't close event loop automatically
-            )
-            
-        except KeyboardInterrupt:
-            logger.info("Bot stopped by user")
-            break
-        except Exception as e:
-            logger.error(f"Bot crashed with error: {e}")
-            logger.info("Restarting bot in 30 seconds...")
-            print(f"❌ Bot crashed: {e}")
-            print("🔄 Restarting in 30 seconds...")
-            time.sleep(30)
-
-
-if __name__ == '__main__':
-    try:
-        main()
+                if AUTO_START:
+                    print("🚀 Auto-start: ENABLED - Monitoring active")
+                else:
+                    print("📱 Auto-start: DISABLED (manual operation)")
+                    
+                if AUTO_NOTIFY:
+                    print("🔔 Auto-notifications: ENABLED (users auto-subscribed on /start)")
+                else:
+                    print("📱 Auto-notifications: DISABLED (manual /subscribe required)")
+                    
+                print(f"📝 Logging to: toyota_bot.log")
+                print("Press Ctrl+C to stop")
+                
+                # Run the bot with improved settings
+                application.run_polling(
+                    drop_pending_updates=True,
+                    poll_interval=2.0,  # Increased interval to reduce conflicts
+                    close_loop=False    # Don't close event loop automatically
+                )
+                
+            except KeyboardInterrupt:
+                logger.info("Bot stopped by user")
+                remove_lock_file()
+                break
+            except Exception as e:
+                logger.error(f"Bot crashed with error: {e}")
+                logger.info("Restarting bot in 30 seconds...")
+                print(f"❌ Bot crashed: {e}")
+                print("🔄 Restarting in 30 seconds...")
+                time.sleep(30)
+    
     except KeyboardInterrupt:
         print("\n👋 Bot stopped by user")
+        remove_lock_file()
     except Exception as e:
         print(f"\n❌ Fatal error: {e}")
         logger.error(f"Fatal error in main: {e}")
+        remove_lock_file()
+
+
+if __name__ == '__main__':
+    main()

@@ -39,6 +39,9 @@ ENV/
 # Logs
 *.log
 
+# Lock files
+*.lock
+
 # OS
 .DS_Store
 Thumbs.db
