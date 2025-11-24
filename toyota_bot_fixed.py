@@ -8,6 +8,8 @@ that mention "defekti" (defects) and sends them to Telegram users.
 import os
 import sys
 import logging
+import asyncio
+import time
 from datetime import datetime
 from typing import List, Dict, Optional
 import requests
@@ -62,7 +64,6 @@ logging.getLogger('httpx').setLevel(logging.WARNING)
 
 # Configuration
 TELEGRAM_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
-BOT_OWNER_ID = os.getenv('BOT_OWNER_ID')  # Set this in .env for auto-start
 AUTO_START = os.getenv('AUTO_START', 'true').lower() == 'true'  # Auto-start monitoring
 AUTO_NOTIFY = os.getenv('AUTO_NOTIFY', 'true').lower() == 'true'  # Auto-enable notifications for all users
 SS_LV_URLS = [
@@ -93,6 +94,18 @@ TARGET_MODELS = ['land cruiser', 'hilux', 'toyota']
 # Storage for subscribed users and seen listings
 subscribed_users = set()
 seen_listing_ids = set()
+
+# Auto-subscribe users on any interaction
+def auto_subscribe_user(user_id: int) -> bool:
+    """
+    Automatically subscribe user if auto-notify is enabled
+    Returns True if user was newly subscribed
+    """
+    if AUTO_NOTIFY and user_id not in subscribed_users:
+        subscribed_users.add(user_id)
+        logger.info(f"Auto-subscribed user {user_id}")
+        return True
+    return False
 
 # Phone extraction cache to avoid repeated Selenium calls
 phone_cache = {}
@@ -726,11 +739,10 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     """
     user_id = update.effective_user.id
     
-    # Auto-subscribe user if auto-notifications are enabled
+    # Auto-subscribe user if enabled
+    newly_subscribed = auto_subscribe_user(user_id)
+    
     if AUTO_NOTIFY:
-        subscribed_users.add(user_id)
-        logger.info(f"Auto-subscribed user {user_id}")
-        
         welcome_message = (
             "👋 Welcome to the Toyota Car Notifier Bot!\n\n"
             "✅ You're automatically subscribed to notifications!\n\n"
@@ -767,7 +779,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         )
     
     await update.message.reply_text(welcome_message)
-    logger.info(f"User {user_id} started the bot")
+    logger.info(f"User {user_id} started the bot{' and was auto-subscribed' if newly_subscribed else ''}")
 
 
 async def subscribe_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -823,7 +835,11 @@ async def search_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     """
     Handle /search command - search for matching Toyota listings
     """
-    logger.info(f"User {update.effective_user.id} requested search listings")
+    user_id = update.effective_user.id
+    logger.info(f"User {user_id} requested search listings")
+    
+    # Auto-subscribe user if enabled
+    newly_subscribed = auto_subscribe_user(user_id)
     
     await update.message.reply_text("🔍 Searching for matching listings...")
     
@@ -840,6 +856,10 @@ async def search_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         
         benzina_listings = filter_all_listings(listings)
         message = format_listings_message(benzina_listings)
+        
+        # Add subscription notice if user was auto-subscribed
+        if newly_subscribed:
+            message += "\n\n✅ You've been automatically subscribed to notifications!"
         
         if len(message) > 4096:
             parts = [message[i:i+4096] for i in range(0, len(message), 4096)]
@@ -917,45 +937,11 @@ async def send_notifications_async(context: ContextTypes.DEFAULT_TYPE, new_listi
 
 async def auto_start_monitoring(application) -> None:
     """
-    Auto-start monitoring - starts monitoring immediately without requiring owner ID
+    Auto-start monitoring - starts monitoring immediately
     """
     if AUTO_START:
         logger.info("🚀 Auto-start: Monitoring started automatically")
-        
-        # If owner ID is provided, subscribe them automatically
-        if BOT_OWNER_ID:
-            try:
-                owner_id = int(BOT_OWNER_ID)
-                subscribed_users.add(owner_id)
-                logger.info(f"🚀 Auto-start: Added bot owner {owner_id} to subscribers")
-                
-                # Send welcome message to owner
-                welcome_msg = (
-                    "🤖 Toyota Bot Auto-Started!\n\n"
-                    "✅ You're automatically subscribed to notifications\n\n"
-                    "🔍 Monitoring:\n"
-                    "• 🚘 All Petrol/Benzin Toyotas\n"
-                    "• 🛻 Diesel Hilux Models\n"
-                    "• 🚙 Diesel Land Cruiser Models\n"
-                    "• 🚨 ANY Toyota from Crash Page\n\n"
-                    f"⚡ Checking every {CHECK_INTERVAL} seconds\n"
-                )
-                
-                if AUTO_NOTIFY:
-                    welcome_msg += "🔔 Auto-notifications: ENABLED for all users\n"
-                else:
-                    welcome_msg += "📱 Manual subscription required for other users\n"
-                    
-                welcome_msg += "📬 You'll get instant notifications!"
-                
-                await application.bot.send_message(chat_id=owner_id, text=welcome_msg)
-                logger.info("Auto-start welcome message sent to owner")
-            except ValueError:
-                logger.error(f"Invalid BOT_OWNER_ID: {BOT_OWNER_ID}")
-            except Exception as e:
-                logger.error(f"Auto-start owner subscription failed: {e}")
-        else:
-            logger.info(f"Auto-start monitoring enabled - Auto-notifications: {'ON' if AUTO_NOTIFY else 'OFF'}")
+        logger.info(f"Auto-notifications: {'ENABLED' if AUTO_NOTIFY else 'DISABLED'}")
     else:
         logger.info("Auto-start disabled")
 
@@ -1030,25 +1016,48 @@ def main() -> None:
             # Create application
             application = Application.builder().token(TELEGRAM_TOKEN).build()
             
+            # Add error handler for conflicts and other errors
+            async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+                """Handle errors caused by updates."""
+                if "Conflict" in str(context.error):
+                    # Ignore conflict errors (multiple instances)
+                    return
+                logger.error(f"Exception while handling an update: {context.error}")
+            
+            application.add_error_handler(error_handler)
+            
             # Add command handlers
             application.add_handler(CommandHandler("start", start_command))
             application.add_handler(CommandHandler("subscribe", subscribe_command))
             application.add_handler(CommandHandler("unsubscribe", unsubscribe_command))
             application.add_handler(CommandHandler("search", search_command))
             
+            # Setup job queue for scheduled tasks
+            job_queue = application.job_queue
+            
             # Initialize auto-start monitoring
             if AUTO_START:
                 # Use a one-time job to set up auto-start after bot is fully initialized
-                job_queue = application.job_queue
+                async def setup_auto_start(context):
+                    try:
+                        await auto_start_monitoring(application)
+                    except Exception as e:
+                        logger.error(f"Error in setup_auto_start: {e}")
+                
                 job_queue.run_once(
-                    lambda context: auto_start_monitoring(application),
+                    setup_auto_start,
                     when=5  # Wait 5 seconds for bot to be ready
                 )
             
             # Add scheduled job for instant notifications (runs every 40 seconds)
-            job_queue = application.job_queue
+            async def scheduled_check_wrapper(context):
+                try:
+                    await scheduled_check(context)
+                except Exception as e:
+                    logger.error(f"Error in scheduled_check_wrapper: {e}")
+            
             job_queue.run_repeating(
-                scheduled_check,
+                scheduled_check_wrapper,
                 interval=CHECK_INTERVAL,
                 first=30  # First run after 30 seconds
             )
@@ -1063,12 +1072,10 @@ def main() -> None:
             print(f"⛽ Filters: Petrol Toyotas + Diesel Hilux/Land Cruiser + ANY Toyota from crash page")
             print(f"⚡ Checking for new cars every {CHECK_INTERVAL} seconds")
             
-            if AUTO_START and BOT_OWNER_ID:
-                print(f"🚀 Auto-start: ENABLED with owner subscription (Owner: {BOT_OWNER_ID})")
-            elif AUTO_START:
-                print("🚀 Auto-start: ENABLED - Monitoring active (no owner subscription)")
+            if AUTO_START:
+                print("🚀 Auto-start: ENABLED - Monitoring active")
             else:
-                print("📱 Auto-start: DISABLED (manual /subscribe required)")
+                print("📱 Auto-start: DISABLED (manual operation)")
                 
             if AUTO_NOTIFY:
                 print("🔔 Auto-notifications: ENABLED (users auto-subscribed on /start)")
@@ -1081,7 +1088,8 @@ def main() -> None:
             # Run the bot with improved settings
             application.run_polling(
                 drop_pending_updates=True,
-                poll_interval=1.0
+                poll_interval=2.0,  # Increased interval to reduce conflicts
+                close_loop=False    # Don't close event loop automatically
             )
             
         except KeyboardInterrupt:
@@ -1096,4 +1104,10 @@ def main() -> None:
 
 
 if __name__ == '__main__':
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        print("\n👋 Bot stopped by user")
+    except Exception as e:
+        print(f"\n❌ Fatal error: {e}")
+        logger.error(f"Fatal error in main: {e}")
