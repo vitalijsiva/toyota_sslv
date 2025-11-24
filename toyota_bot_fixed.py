@@ -16,7 +16,7 @@ from datetime import datetime
 from typing import List, Dict, Optional
 import requests
 from bs4 import BeautifulSoup
-from telegram import Update
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -572,7 +572,7 @@ def filter_defective_cars(listings: List[Dict[str, str]]) -> List[Dict[str, str]
 def filter_benzina_toyotas(listings: List[Dict[str, str]]) -> List[Dict[str, str]]:
     """
     Filter listings for:
-    1. All petrol/gasoline Toyotas
+    1. All petrol/benzin Toyotas
     2. Diesel Hilux
     3. Diesel Land Cruiser
     
@@ -580,7 +580,7 @@ def filter_benzina_toyotas(listings: List[Dict[str, str]]) -> List[Dict[str, str
         listings: List of car listings from Toyota section
         
     Returns:
-        Filtered list matching the criteria
+        Filtered Toyota listings
     """
     if not listings:
         return []
@@ -603,20 +603,20 @@ def filter_benzina_toyotas(listings: List[Dict[str, str]]) -> List[Dict[str, str
         is_hilux = 'hilux' in combined_text
         is_land_cruiser = 'land cruiser' in combined_text or 'landcruiser' in combined_text
         
-        # Check fuel type - petrol/gasoline
+        # Check fuel type - petrol/gasoline/benzin
         is_petrol = any(keyword in combined_text for keyword in ['benzīn', 'benz.', 'benz', 'petrol', 'gas'])
         
-        # Check fuel type - diesel
-        is_diesel = any(keyword in combined_text for keyword in ['dīzel', 'diesel', 'diz.'])
+        # Check fuel type - diesel (including "D" suffix in engine sizes like "3.0D")
+        is_diesel = any(keyword in combined_text for keyword in ['dīzel', 'diesel', 'diz.', '.0d ', '.0d,', '.0d\n'])
         
-        # Include if:
-        # 1. Any Toyota with petrol/gasoline, OR
+        # Include:
+        # 1. Any Toyota with petrol/benzin, OR
         # 2. Hilux with diesel, OR
         # 3. Land Cruiser with diesel
         if (is_toyota and is_petrol) or (is_hilux and is_diesel) or (is_land_cruiser and is_diesel):
             filtered.append(listing)
     
-    logger.info(f"Filtered {len(filtered)} matching listings (fuel-specific Toyotas) from {len(listings)} total")
+    logger.info(f"Filtered {len(filtered)} matching Toyotas (petrol + diesel Hilux/LC) from {len(listings)} total")
     return filtered
 
 
@@ -746,20 +746,21 @@ def filter_all_listings(listings: List[Dict[str, str]]) -> List[Dict[str, str]]:
     return all_filtered
 
 
-def format_listings_message(listings: List[Dict[str, str]]) -> str:
+def format_listings_message(listings: List[Dict[str, str]]) -> tuple:
     """
-    Format listings into a clean Telegram message
+    Format listings into a clean Telegram message with inline keyboard buttons
     
     Args:
         listings: List of car listings
         
     Returns:
-        Formatted string message
+        Tuple of (formatted message string, inline keyboard markup)
     """
     if not listings:
-        return "Nav jaunu sludinājumu / No new listings found."
+        return ("Nav jaunu sludinājumu / No new listings found.", None)
     
     message = f"🚗 *Jauni Toyota sludinājumi* ({len(listings)} gab.)\n\n"
+    keyboard_buttons = []
     
     for i, listing in enumerate(listings, 1):
         title = listing['title']
@@ -782,14 +783,13 @@ def format_listings_message(listings: List[Dict[str, str]]) -> str:
         if car_make and car_model:
             message += f"🚗 {car_make} {car_model}" + (f" ({car_year})" if car_year else "") + "\n"
         
-        message += f"💰 Cena: `{price}`\n"
-        # Escape special characters in link for Telegram
-        escaped_link = link.replace(')', '%29').replace('(', '%28')
-        message += f"🔗 {escaped_link}\n\n"
+        message += f"💰 Cena: `{price}`\n\n"
+        
+        # Add button for this listing
+        keyboard_buttons.append([InlineKeyboardButton(f"🔗 Skatīt {i}", url=link)])
     
-    return message
-    
-    return message
+    keyboard = InlineKeyboardMarkup(keyboard_buttons) if keyboard_buttons else None
+    return (message, keyboard)
 
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -914,7 +914,7 @@ async def search_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             return
         
         benzina_listings = filter_all_listings(listings)
-        message = format_listings_message(benzina_listings)
+        message, keyboard = format_listings_message(benzina_listings)
         
         # Add subscription notice if user was auto-subscribed
         if newly_subscribed:
@@ -925,7 +925,7 @@ async def search_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             for part in parts:
                 await update.message.reply_text(part)
         else:
-            await update.message.reply_text(message)
+            await update.message.reply_text(message, reply_markup=keyboard)
             
     except Exception as e:
         logger.error(f"Error in search_command: {e}")
@@ -962,22 +962,23 @@ async def send_notifications_async(context: ContextTypes.DEFAULT_TYPE, new_listi
         if car_make and car_model:
             car_info = f"🚗 {car_make} {car_model}" + (f" ({car_year})" if car_year else "") + "\n"
         
-        # Escape special characters in link for Telegram
-        escaped_link = listing['link'].replace(')', '%29').replace('(', '%28')
+        link = listing['link']
         
         notification = (
             f"🆕 NEW LISTING!\n\n"
             f"🚗 {listing['title']}\n"
             + (f"🏷️ {crash_labels}\n" if crash_labels else "")
             + car_info
-            + f"💰 {listing['price']}\n"
-            + f"🔗 ({escaped_link})\n\n"
+            + f"💰 {listing['price']}\n\n"
             + f"⏰ {datetime.now().strftime('%H:%M:%S')}"
         )
         
+        # Create inline keyboard with link button
+        keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("🔗 Skatīt sludinājumu", url=link)]])
+        
         # Create tasks for sending to all users for this listing
         for user_id in subscribed_users.copy():
-            task = context.bot.send_message(chat_id=user_id, text=notification)
+            task = context.bot.send_message(chat_id=user_id, text=notification, reply_markup=keyboard)
             tasks.append(task)
     
     if tasks:
@@ -1144,7 +1145,7 @@ def main() -> None:
                 print(f"   2. Transport with defects/after crash (sell)")
                 print(f"   3. Toyota Hilux (sell)")
                 print(f"   4. Toyota Land Cruiser (sell)")
-                print(f"⛽ Filters: Petrol Toyotas + Diesel Hilux/Land Cruiser + ANY Toyota from crash page")
+                print(f"⛽ Filters: Petrol/Benzin Toyotas + Diesel Hilux/Land Cruiser + ANY Toyota from crash page")
                 print(f"⚡ Checking for new cars every {CHECK_INTERVAL} seconds")
                 
                 if AUTO_START:
